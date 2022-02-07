@@ -49,7 +49,7 @@ This will give you the latest datalog record of the specified account with its t
 ## Extrinsics
 **Providing seed** (any raw or mnemonic) while initializing **will let you create and submit extrinsics**:
 ```python
-interface = RI.RobonmicsInterface(seed:str = <seed>)
+interface = RI.RobonomicsInterface(seed:str = <seed>)
 hash = interface.custom_extrinsic("DigitalTwin", "create")
 ```
 `hash` here is the transaction hash of the succeeded extrinsic. You can also specify arguments for the extrinsic as a dictionary.
