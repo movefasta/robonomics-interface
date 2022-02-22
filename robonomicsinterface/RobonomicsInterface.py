@@ -1,17 +1,19 @@
-import asyncio
 import logging
 
 import substrateinterface as substrate
 import typing as tp
 
-from threading import Thread
+from enum import Enum
 from scalecodec.types import GenericCall, GenericExtrinsic
 
 from .constants import REMOTE_WS, TYPE_REGISTRY
 from .exceptions import NoPrivateKey
+from .decorators import connect_close_substrate_node
 
-Datalog = tp.Dict[str, tp.Union[int, str]]
+Datalog = tp.Tuple[int, tp.Union[int, str]]
 NodeTypes = tp.Dict[str, tp.Dict[str, tp.Union[str, tp.Any]]]
+
+logger = logging.getLogger(__name__)
 
 
 class RobonomicsInterface:
@@ -25,74 +27,21 @@ class RobonomicsInterface:
         seed: tp.Optional[str] = None,
         remote_ws: tp.Optional[str] = None,
         type_registry: tp.Optional[NodeTypes] = None,
-        keep_alive: bool = False,
     ) -> None:
         """
         Instance of a class is an interface with a node. Here this interface is initialized.
 
         @param seed: account seed in mnemonic/raw form. When not passed, no extrinsics functionality
-        @param remote_ws: node url. Default node address is "wss://main.frontier.rpc.robonomics.network".
+        @param remote_ws: node url. Default node address is "wss://kusama.rpc.robonomics.network".
         Another address may be specified (e.g. "ws://127.0.0.1:9944" for local node).
         @param type_registry: types used in the chain. Defaults are the most frequently used in Robonomics
-        @param keep_alive: whether send ping calls each 200 secs to keep interface opened or not
         """
 
-        self._interface: substrate.SubstrateInterface
         self._keypair: tp.Optional[substrate.Keypair] = self._create_keypair(seed) if seed else None
-
-        if not self._keypair:
-            logging.warning("No seed specified, you won't be able to sign extrinsics, fetching chainstate only.")
-
-        if type_registry:
-            logging.warning("Using custom type registry for the node")
-
-        logging.info("Establishing connection with Robonomics node")
-        self._interface = self._establish_connection(remote_ws or REMOTE_WS, type_registry or TYPE_REGISTRY)
-
-        if keep_alive:
-            self._keep_alive_pinger()
-
-        logging.info("Successfully established connection to Robonomics node")
-
-    def _keep_alive_pinger(self) -> None:
-        """
-        It uses main thread event_loop running in another thread to add keep_alive coroutines of each interface there.
-        !Be careful using asyncio, since main thread event_loop is already running (main thread is not locked though).!
-        You are to add new coroutines to a main thread event_loop, not to run it. Also using this flag while creating an
-        interface NOT in the main thread will throw RuntimeError.
-
-        This was made so because of a simple way to add new interfaces' keep_alive tasks to the same event_loop (to the
-        main one) without blocking main execution thread (since main thread event_loop runs in a separate thread).
-
-        That's so with 1, 2, 3 or 18 interfaces with a keep_alive option you will still have only one dedicated thread
-        for all keep_alive tasks.
-        """
-
-        loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._keep_alive(), loop=loop)
-        else:
-            keep_alive_thread = Thread(target=self._keep_alive_loop_in_thread, args=(loop,))
-            keep_alive_thread.start()
-
-    async def _keep_alive(self) -> None:
-        """
-        Keep the connection alive by sending websocket ping each 200 seconds.
-        """
-
-        while True:
-            await asyncio.sleep(200)
-            self._interface.websocket.ping()
-
-    def _keep_alive_loop_in_thread(self, loop: asyncio.AbstractEventLoop) -> None:
-        """
-        Run a keep_alive coroutine in the passed loop. If selected loop is already running, add a coroutine to it, else
-        run a new loop with a keep_alive coroutine.
-
-        @param loop: AbstractEventLoop passed from class __init__ function
-        """
-
-        loop.run_until_complete(self._keep_alive())
+        self.remote_ws = remote_ws or REMOTE_WS
+        self.type_registry = type_registry or TYPE_REGISTRY
+        self.interface: tp.Optional[substrate.SubstrateInterface] = None
+        # This is a dummy since interface is opened-closed every time it's needed
 
     @staticmethod
     def _create_keypair(seed: str) -> substrate.Keypair:
@@ -109,29 +58,14 @@ class RobonomicsInterface:
         else:
             return substrate.Keypair.create_from_mnemonic(seed, ss58_format=32)
 
-    @staticmethod
-    def _establish_connection(url: str, types: NodeTypes) -> substrate.SubstrateInterface:
-        """
-        Create a substrate interface for interacting wit Robonomics node
-
-        @param url: node endpoint
-        @param types: json types used by pallets
-
-        @return: interface of a Robonomics node connection
-        """
-
-        return substrate.SubstrateInterface(
-            url=url,
-            ss58_format=32,
-            type_registry_preset="substrate-node-template",
-            type_registry=types,
-        )
-
+    @connect_close_substrate_node
     def custom_chainstate(
         self,
         module: str,
         storage_function: str,
         params: tp.Optional[tp.Union[tp.List[tp.Union[str, int]], str, int]] = None,
+        block_hash: tp.Optional[str] = None,
+        subscription_handler: tp.Optional[callable] = None,
     ) -> tp.Any:
         """
         Create custom queries to fetch data from the Chainstate. Module names and storage functions, as well as required
@@ -140,14 +74,34 @@ class RobonomicsInterface:
         @param module: chainstate module
         @param storage_function: storage function
         @param params: query parameters. None if no parameters. Include in list, if several
-
+        @param block_hash: Retrieves data as of passed block hash
+        @param subscription_handler: Callback function that processes the updates of the storage query subscription.
+        The workflow is the same as in substrateinterface lib. Calling method with this parameter blocks current thread!
+                Example of subscription handler:
+        ```
+        def subscription_handler(obj, update_nr, subscription_id):
+            if update_nr == 0:
+                print('Initial data:', obj.value)
+            if update_nr > 0:
+                # Do something with the update.
+                print('data changed:', obj.value)
+            # The execution will block until an arbitrary value is returned, which will be the result of the `query`
+            if update_nr > 1:
+                return obj
+        ```
         @return: output of the query in any form
         """
 
-        logging.info("Performing query")
-        return self._interface.query(module, storage_function, [params] if params else None)
+        logger.info("Performing query")
+        return self.interface.query(
+            module,
+            storage_function,
+            [params] if params is not None else None,
+            block_hash=block_hash,
+            subscription_handler=subscription_handler,
+        )
 
-    def _define_address(self) -> str:
+    def define_address(self) -> str:
         """
         define ss58_address of an account, which seed was provided while initializing an interface
 
@@ -158,7 +112,9 @@ class RobonomicsInterface:
             raise NoPrivateKey("No private key was provided, unable to determine self address")
         return str(self._keypair.ss58_address)
 
-    def fetch_datalog(self, addr: tp.Optional[str] = None, index: tp.Optional[int] = None) -> tp.Optional[Datalog]:
+    def fetch_datalog(
+        self, addr: tp.Optional[str] = None, index: tp.Optional[int] = None, block_hash: tp.Optional[str] = None
+    ) -> tp.Optional[Datalog]:
         """
         Fetch datalog record of a provided account. Fetch self datalog if no address provided and interface was
         initialized with a seed.
@@ -167,27 +123,72 @@ class RobonomicsInterface:
         datalog if keypair was created, else raises NoPrivateKey
         @param index: record index. case int: fetch datalog by specified index
                                     case None: fetch latest datalog
+        @param block_hash: Retrieves data as of passed block hash
 
-        @return: Dictionary. Datalog of the account with a timestamp, None if no records.
+        @return: Tuple. Datalog of the account with a timestamp, None if no records.
         """
 
-        address: str = addr or self._define_address()
+        address: str = addr or self.define_address()
 
-        logging.info(
+        logger.info(
             f"Fetching {'latest datalog record' if not index else 'datalog record #' + str(index)}" f" of {address}."
         )
 
         if index:
-            record: Datalog = self.custom_chainstate("Datalog", "DatalogItem", [address, index]).value
-            return record if record["timestamp"] != 0 else None
+            record: Datalog = self.custom_chainstate(
+                "Datalog", "DatalogItem", [address, index], block_hash=block_hash
+            ).value
+            return record if record[0] != 0 else None
         else:
-            index_latest: int = self.custom_chainstate("Datalog", "DatalogIndex", address).value["end"] - 1
+            index_latest: int = self.custom_chainstate("Datalog", "DatalogIndex", address, block_hash=block_hash).value[
+                "end"
+            ] - 1
             return (
-                self.custom_chainstate("Datalog", "DatalogItem", [address, index_latest]).value
+                self.custom_chainstate("Datalog", "DatalogItem", [address, index_latest], block_hash=block_hash).value
                 if index_latest != -1
                 else None
             )
 
+    def rws_auction_queue(self, block_hash: tp.Optional[str] = None) -> tp.List[tp.Optional[int]]:
+        """
+        Get an auction queue of Robonomics Web Services subscriptions
+
+        @param block_hash: Retrieves data as of passed block hash
+
+        @return: Auction queue of Robonomics Web Services subscriptions
+        """
+
+        logger.info("Fetching auctions queue list")
+        return self.custom_chainstate("RWS", "AuctionQueue", block_hash=block_hash)
+
+    def rws_auction(self, index: int, block_hash: tp.Optional[str] = None) -> tp.Dict[str, tp.Union[str, int, dict]]:
+        """
+        Get to now information about subscription auction
+
+        @param index: Auction index
+        @param block_hash: Retrieves data as of passed block hash
+
+        @return: Auction info
+        """
+
+        logger.info(f"Fetching auction {index} information")
+        return self.custom_chainstate("RWS", "Auction", index, block_hash=block_hash)
+
+    def rws_list_devices(self, addr: str, block_hash: tp.Optional[str] = None) -> tp.List[tp.Optional[str]]:
+        """
+        Fetch list of RWS added devices
+
+        @param addr: Subscription owner
+        @param block_hash: Retrieves data as of passed block hash
+
+        @return: List of added devices. Empty if none
+        """
+
+        logging.info(f"Fetching list of RWS devices set by owner {addr}")
+
+        return self.custom_chainstate("RWS", "Devices", addr, block_hash=block_hash)
+
+    @connect_close_substrate_node
     def custom_extrinsic(
         self,
         call_module: str,
@@ -199,8 +200,8 @@ class RobonomicsInterface:
         Create an extrinsic, sign&submit it. Module names and functions, as well as required parameters are available
         at https://parachain.robonomics.network/#/extrinsics
 
-        @param call_module: Call module from extrinsic tab
-        @param call_function: Call function from extrinsic tab
+        @param call_module: Call module from extrinsic tab on portal
+        @param call_function: Call function from extrinsic tab on portal
         @param params: Call parameters as a dictionary. None for no parameters
         @param nonce: transaction nonce, defined automatically if None. Due to e feature of substrate-interface lib,
         to create an extrinsic with incremented nonce, pass account's current nonce. See
@@ -213,21 +214,19 @@ class RobonomicsInterface:
         if not self._keypair:
             raise NoPrivateKey("No seed was provided, unable to use extrinsics.")
 
-        logging.info(f"Creating a call {call_module}:{call_function}")
-        call: GenericCall = self._interface.compose_call(
-            call_module=call_module,
-            call_function=call_function,
-            call_params=params or None,
+        logger.info(f"Creating a call {call_module}:{call_function}")
+        call: GenericCall = self.interface.compose_call(
+            call_module=call_module, call_function=call_function, call_params=params or None
         )
 
-        logging.info("Creating extrinsic")
-        extrinsic: GenericExtrinsic = self._interface.create_signed_extrinsic(
+        logger.info("Creating extrinsic")
+        extrinsic: GenericExtrinsic = self.interface.create_signed_extrinsic(
             call=call, keypair=self._keypair, nonce=nonce
         )
 
-        logging.info("Submitting extrinsic")
-        receipt: substrate.ExtrinsicReceipt = self._interface.submit_extrinsic(extrinsic, wait_for_inclusion=True)
-        logging.info(
+        logger.info("Submitting extrinsic")
+        receipt: substrate.ExtrinsicReceipt = self.interface.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+        logger.info(
             f"Extrinsic {receipt.extrinsic_hash} for RPC {call_module}:{call_function} submitted and "
             f"included in block {receipt.block_hash}"
         )
@@ -247,7 +246,7 @@ class RobonomicsInterface:
         @return: Hash of the datalog transaction
         """
 
-        logging.info(f"Writing datalog {data}")
+        logger.info(f"Writing datalog {data}")
         return self.custom_extrinsic("Datalog", "record", {"record": data}, nonce)
 
     def send_launch(self, target_address: str, toggle: bool, nonce: tp.Optional[int] = None) -> str:
@@ -264,9 +263,10 @@ class RobonomicsInterface:
         @return: Hash of the launch transaction
         """
 
-        logging.info(f"Sending {'ON' if toggle else 'OFF'} launch command to {target_address}")
+        logger.info(f"Sending {'ON' if toggle else 'OFF'} launch command to {target_address}")
         return self.custom_extrinsic("Launch", "launch", {"robot": target_address, "param": toggle}, nonce)
 
+    @connect_close_substrate_node
     def get_account_nonce(self, account_address: tp.Optional[str] = None) -> int:
         """
         Get current account nonce
@@ -279,11 +279,91 @@ class RobonomicsInterface:
         for example.
         """
 
-        return self._interface.get_account_nonce(account_address=account_address or self._define_address())
+        return self.interface.get_account_nonce(account_address=account_address or self.define_address())
 
+    def rws_bid(self, index: int, amount: int) -> str:
+        """
+        Bid to win a subscription!
+
+
+        @param index: Auction index
+        @param amount: Your bid in Weiners (!)
+        """
+
+        logger.info(f"Bidding on auction {index} with {amount} Weiners (appx. {round(amount / 10 ** 9, 2)} XRT)")
+        return self.custom_extrinsic("RWS", "bid", {"index": index, "amount": amount})
+
+    def rws_set_devices(self, devices: tp.List[str]) -> str:
+        """
+        Set devices which are authorized to use RWS subscriptions held by the extrinsic author
+
+        @param devices: Devices authorized to use RWS subscriptions. Include in list.
+
+        @return: transaction hash
+        """
+
+        logger.info(f"Allowing {devices} to use {self.define_address()} subscription")
+        return self.custom_extrinsic("RWS", "set_devices", {"devices": devices})
+
+    def rws_custom_call(
+        self,
+        subscription_owner_addr: str,
+        call_module: str,
+        call_function: str,
+        params: tp.Optional[tp.Dict[str, tp.Any]] = None,
+    ) -> str:
+        """
+        Send transaction from a device given a RWS subscription
+
+        @param subscription_owner_addr: Subscription owner, the one who granted this device ability to send transactions
+        @param call_module: Call module from extrinsic tab on portal
+        @param call_function: Call function from extrinsic tab on portal
+        @param params: Call parameters as a dictionary. None for no parameters
+
+        @return: Transaction hash
+        """
+
+        logger.info("Sending transaction using subscription")
+        return self.custom_extrinsic(
+            "RWS",
+            "call",
+            {
+                "subscription_id": subscription_owner_addr,
+                "call": {"call_module": call_module, "call_function": call_function, "call_args": params},
+            },
+        )
+
+    def rws_record_datalog(self, subscription_owner_addr: str, data: str) -> str:
+        """
+        Write any string to datalog from a device which was granted a subscription.
+
+        @param subscription_owner_addr: Subscription owner, the one who granted this device ability to send transactions
+        @param data: string to be stored in datalog
+
+        @return: Hash of the datalog transaction
+        """
+
+        return self.rws_custom_call(subscription_owner_addr, "Datalog", "record", {"record": data})
+
+    def rws_send_launch(self, subscription_owner_addr: str, target_address: str, toggle: bool) -> str:
+        """
+        Send Launch command to device from another device which was granted a subscription.
+
+        @param subscription_owner_addr: Subscription owner, the one who granted this device ability to send transactions
+        @param target_address: device to be triggered with launch
+        @param toggle: whether send ON or OFF command. ON == True, OFF == False
+
+        @return: Hash of the launch transaction
+        """
+
+        return self.rws_custom_call(
+            subscription_owner_addr, "Launch", "launch", {"robot": target_address, "param": toggle}
+        )
+
+    @connect_close_substrate_node
     def custom_rpc_request(
         self, method: str, params: tp.Optional[tp.List[str]], result_handler: tp.Optional[tp.Callable]
-    ) -> tp.Any:
+    ) -> dict:
         """
         Method that handles the actual RPC request to the Substrate node. The other implemented functions eventually
         use this method to perform the request.
@@ -295,7 +375,17 @@ class RobonomicsInterface:
         @return: result of the request
         """
 
-        return self._interface.rpc_request(method, params, result_handler)
+        return self.interface.rpc_request(method, params, result_handler)
+
+    @connect_close_substrate_node
+    def subscribe_block_headers(self, callback: callable) -> dict:
+        """
+        Get chain head block headers
+
+        @return: Chain head block headers
+        """
+
+        return self.interface.subscribe_block_headers(subscription_handler=callback)
 
 
 class PubSub:
@@ -404,3 +494,71 @@ class PubSub:
         """
 
         return self._pubsub_interface.custom_rpc_request("pubsub_unsubscribe", [subscription_id], result_handler)
+
+
+class SubEvent(Enum):
+    NewRecord = "NewRecord"
+    NewLaunch = "NewLaunch"
+    Transfer = "Transfer"
+
+
+class Subscriber:
+    """
+    Class intended for use in cases when needed to subscribe on chainstate updates/events. Blocks current thread!
+    """
+
+    def __init__(
+        self,
+        interface: RobonomicsInterface,
+        subscribed_event: SubEvent,
+        subscription_handler: callable,
+        addr: tp.Optional[tp.Union[tp.List[str], str]] = None,
+    ) -> None:
+        """
+        Initiates an instance for further use and starts a subscription for a selected action
+
+        @param interface: RobonomicsInterface instance
+        @param subscribed_event: Event in substrate chain to be awaited. Choose from [NewRecord, NewLaunch, Transfer]
+        This parameter should be a SubEvent class attribute. This also requires importing this class.
+        @param subscription_handler: Callback function that processes the updates of the storage.
+        THIS FUNCTION IS MEANT TO ACCEPT ONLY ONE ARGUMENT (THE NEW EVENT DESCRIPTION TUPLE).
+        @param addr: ss58 type 32 address(-es) of an account(-s) which is(are) meant to be event target. If None, will
+        subscribe to all such events never-mind target address(-es).
+        """
+
+        self._subscriber_interface: RobonomicsInterface = interface
+
+        self._event: SubEvent = subscribed_event
+        self._callback: callable = subscription_handler
+        self._target_address: tp.Optional[tp.Union[tp.List[str], str]] = addr
+
+        self._subscribe_event()
+
+    def _subscribe_event(self) -> None:
+        """
+        Subscribe to events targeted to a certain account (launch, transfer). Call subscription_handler when updated
+        """
+
+        self._subscriber_interface.subscribe_block_headers(self._event_callback)
+
+    def _event_callback(self, index_obj: tp.Any, update_nr: int, subscription_id: int) -> None:
+        """
+        Function, processing updates in event list storage. When update, filters events to a desired account
+        and passes the event description to the user-provided callback method.
+
+        @param index_obj: updated event list
+        @param update_nr: update counter. Increments every new update added. Starts with 0
+        @param subscription_id: subscription ID
+        """
+
+        if update_nr != 0:
+            chain_events = self._subscriber_interface.custom_chainstate("System", "Events")
+            for events in chain_events:
+                if events.value["event_id"] == self._event.value:
+                    if self._target_address is None:
+                        self._callback(events.value["event"]["attributes"])  # All events
+                    elif (
+                        events.value["event"]["attributes"][0 if self._event == SubEvent.NewRecord else 1]
+                        in self._target_address
+                    ):
+                        self._callback(events.value["event"]["attributes"])  # address-targeted
